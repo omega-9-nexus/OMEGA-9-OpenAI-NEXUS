@@ -14,6 +14,7 @@ import type {
   ModelResponse,
   ResponseStreamEvent,
   SerializedOutputType,
+  UsageInput,
 } from '@openai/agents-core';
 import OpenAI from 'openai';
 import type { Stream } from 'openai/streaming';
@@ -37,8 +38,11 @@ import {
 import { protocol } from '@openai/agents-core';
 import { getOpenAIRetryAdvice } from './retryAdvice';
 import { normalizePromptCacheRetention } from './utils/modelSettings';
+import type { OpenAIClient } from './openaiClient';
 
 export const FAKE_ID = 'FAKE_ID';
+const GPT_56_MODEL_PATTERN =
+  /^gpt-5\.6(?:-(?:sol|terra|luna)(?:-\d{4}-\d{2}-\d{2})?)?$/;
 
 // Some Chat Completions API compatible providers return a reasoning property on the message
 // If that's the case we handle them separately
@@ -75,13 +79,14 @@ export class OpenAIChatCompletionsModel implements Model {
   #strictFeatureValidation: boolean;
   #hasWarnedUnsupportedPrompt = false;
   #hasWarnedUnsupportedConversationState = false;
+  #hasWarnedUnsupportedReasoningSettings = false;
 
   constructor(
-    client: OpenAI,
+    client: OpenAIClient,
     model: string,
     options: OpenAIChatCompletionsModelOptions = {},
   ) {
-    this.#client = client;
+    this.#client = client as OpenAI;
     this.#model = model;
     this.#strictFeatureValidation = options.strictFeatureValidation ?? false;
   }
@@ -93,6 +98,7 @@ export class OpenAIChatCompletionsModel implements Model {
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     this.#handleUnsupportedServerManagedConversationState(request);
     this.#handleUnsupportedPrompt(request);
+    this.#handleUnsupportedReasoningSettings(request);
 
     const response = await withGenerationSpan(async (span) => {
       span.spanData.model = this.#model;
@@ -231,6 +237,7 @@ export class OpenAIChatCompletionsModel implements Model {
   ): AsyncIterable<ResponseStreamEvent> {
     this.#handleUnsupportedServerManagedConversationState(request);
     this.#handleUnsupportedPrompt(request);
+    this.#handleUnsupportedReasoningSettings(request);
 
     const span = request.tracing ? createGenerationSpan() : undefined;
     try {
@@ -370,6 +377,39 @@ export class OpenAIChatCompletionsModel implements Model {
     }
   }
 
+  #handleUnsupportedReasoningSettings(request: ModelRequest) {
+    const reasoning = request.modelSettings.reasoning;
+    if (!reasoning) {
+      return;
+    }
+
+    const unsupported = (['mode', 'context'] as const).filter(
+      (name) => reasoning[name] !== undefined && reasoning[name] !== null,
+    );
+    if (unsupported.length === 0) {
+      return;
+    }
+
+    const unsupportedParams = unsupported
+      .map((name) => `reasoning.${name}`)
+      .join(', ');
+    const message =
+      `OpenAIChatCompletionsModel does not support ${unsupportedParams}. ` +
+      'These reasoning settings require the Responses API; Chat Completions only uses reasoning.effort.';
+
+    if (this.#strictFeatureValidation) {
+      throw new UserError(message);
+    }
+
+    if (!this.#hasWarnedUnsupportedReasoningSettings) {
+      logger.warn(
+        `${message} Ignoring unsupported reasoning settings; ` +
+          'enable strict feature validation to raise an error instead.',
+      );
+      this.#hasWarnedUnsupportedReasoningSettings = true;
+    }
+  }
+
   /**
    * @internal
    */
@@ -442,10 +482,20 @@ export class OpenAIChatCompletionsModel implements Model {
       span.spanData.input = messages;
     }
 
-    const providerData = request.modelSettings.providerData ?? {};
+    const providerData = { ...(request.modelSettings.providerData ?? {}) };
+    const requestInternal = (
+      request as ModelRequest & {
+        _internal?: { reasoningEffortImplicit?: boolean };
+      }
+    )._internal;
+    const omitImplicitReasoningEffort =
+      requestInternal?.reasoningEffortImplicit === true &&
+      (providerData.reasoning_effort !== undefined ||
+        (tools.length > 0 && GPT_56_MODEL_PATTERN.test(this.#model)));
     if (
       request.modelSettings.reasoning &&
-      request.modelSettings.reasoning.effort
+      request.modelSettings.reasoning.effort &&
+      !omitImplicitReasoningEffort
     ) {
       // merge the top-level reasoning.effort into provider data
       providerData.reasoning_effort = request.modelSettings.reasoning.effort;
@@ -481,6 +531,7 @@ export class OpenAIChatCompletionsModel implements Model {
       prompt_cache_retention: normalizePromptCacheRetention(
         request.modelSettings.promptCacheRetention,
       ),
+      prompt_cache_options: request.modelSettings.promptCacheOptions,
       ...providerData,
     };
 
@@ -558,7 +609,7 @@ function getResponseFormat(
 
 function toResponseUsage(
   usage: CompletionUsage,
-): OpenAI.Responses.ResponseUsage & { requests: number } {
+): UsageInput & { requests: number } {
   return {
     requests: 1,
     input_tokens: usage.prompt_tokens,

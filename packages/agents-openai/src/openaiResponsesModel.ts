@@ -1,6 +1,5 @@
 import {
   Model,
-  RequestUsage,
   Usage,
   withResponseSpan,
   createResponseSpan,
@@ -53,6 +52,7 @@ import {
   mergeQueryParamsIntoURL,
   splitResponsesTransportOverrides,
 } from './responsesTransportUtils';
+import type { OpenAIClient } from './openaiClient';
 import {
   CodeInterpreterStatus,
   FileSearchStatus,
@@ -64,6 +64,11 @@ import {
   getSnakeCasedProviderDataWithoutReservedKeys,
 } from './utils/providerData';
 import { normalizePromptCacheRetention } from './utils/modelSettings';
+import {
+  normalizeInstructions,
+  searchParamsToAuthHeaderQuery,
+  toRequestUsageEntry,
+} from './responsesUtils';
 import { ProviderData } from '@openai/agents-core/types';
 import {
   encodeUint8ArrayToBase64,
@@ -71,6 +76,10 @@ import {
   getToolSearchProviderCallId,
   normalizeHostedMcpRequireApproval,
 } from '@openai/agents-core/utils';
+import {
+  formatInlineData,
+  getInlineMediaType,
+} from '@openai/agents-core/utils/internal';
 
 type ToolChoice =
   | ToolChoiceOptions
@@ -771,7 +780,7 @@ function convertLegacyToolOutputContent(
     const legacyImageUrl = (output as any).imageUrl;
     const legacyFileId = (output as any).fileId;
     const dataValue = (output as any).data;
-    const topLevelInlineMediaType = getImageInlineMediaType(
+    const topLevelInlineMediaType = getInlineMediaType(
       output as Record<string, any>,
     );
 
@@ -780,7 +789,7 @@ function convertLegacyToolOutputContent(
     } else if (isRecord(output.image)) {
       const imageObj = output.image as Record<string, any>;
       const inlineMediaType =
-        getImageInlineMediaType(imageObj) ?? topLevelInlineMediaType;
+        getInlineMediaType(imageObj) ?? topLevelInlineMediaType;
       if (typeof imageObj.url === 'string' && imageObj.url.length > 0) {
         structured.image = imageObj.url;
       } else if (
@@ -1138,33 +1147,6 @@ function getShellCallProviderDataForInput(
   };
 }
 
-function getImageInlineMediaType(
-  source: Record<string, any>,
-): string | undefined {
-  if (typeof source.mediaType === 'string' && source.mediaType.length > 0) {
-    return source.mediaType;
-  }
-  if (
-    typeof (source as any).mimeType === 'string' &&
-    (source as any).mimeType.length > 0
-  ) {
-    return (source as any).mimeType;
-  }
-  return undefined;
-}
-
-function formatInlineData(
-  data: string | Uint8Array,
-  mediaType?: string,
-): string {
-  if (typeof data === 'string' && data.startsWith('data:')) {
-    return data;
-  }
-  const base64 =
-    typeof data === 'string' ? data : encodeUint8ArrayToBase64(data);
-  return mediaType ? `data:${mediaType};base64,${base64}` : base64;
-}
-
 function toOpenAIShellSkill(
   skill: SerializedShellContainerSkill,
 ): OpenAI.Responses.SkillReference | OpenAI.Responses.InlineSkill {
@@ -1395,9 +1377,12 @@ function getTools<_TContext = unknown>(
           );
         }
 
-        const { tool: openaiTool, include: openaiIncludes } = converTool(tool, {
-          usePreviewComputerTool,
-        });
+        const { tool: openaiTool, include: openaiIncludes } = convertTool(
+          tool,
+          {
+            usePreviewComputerTool,
+          },
+        );
         if (namespaceState.functionNames.has(tool.name)) {
           throw new UserError(
             `Namespace "${namespaceName}" cannot contain duplicate function tool name "${tool.name}".`,
@@ -1429,7 +1414,7 @@ function getTools<_TContext = unknown>(
       hasDeferredSearchableTool = true;
     }
 
-    const { tool: openaiTool, include: openaiIncludes } = converTool(tool, {
+    const { tool: openaiTool, include: openaiIncludes } = convertTool(tool, {
       usePreviewComputerTool,
     });
     openaiTools.push(openaiTool);
@@ -1464,7 +1449,7 @@ function getTools<_TContext = unknown>(
   };
 }
 
-function converTool<_TContext = unknown>(
+function convertTool<_TContext = unknown>(
   tool: SerializedTool,
   options?: {
     usePreviewComputerTool?: boolean;
@@ -1677,6 +1662,9 @@ function getInputMessageContent(
     return {
       type: 'input_text',
       text: entry.text,
+      ...(entry.promptCacheBreakpoint
+        ? { prompt_cache_breakpoint: entry.promptCacheBreakpoint }
+        : {}),
       ...getSnakeCasedProviderDataWithoutReservedKeys(entry.providerData, [
         'type',
         'text',
@@ -1698,6 +1686,9 @@ function getInputMessageContent(
     }
     return {
       ...imageEntry,
+      ...(entry.promptCacheBreakpoint
+        ? { prompt_cache_breakpoint: entry.promptCacheBreakpoint }
+        : {}),
       ...getSnakeCasedProviderDataWithoutReservedKeys(entry.providerData, [
         'type',
         'detail',
@@ -1753,6 +1744,9 @@ function getInputMessageContent(
     }
     return {
       ...fileEntry,
+      ...(entry.promptCacheBreakpoint
+        ? { prompt_cache_breakpoint: entry.promptCacheBreakpoint }
+        : {}),
       ...getSnakeCasedProviderDataWithoutReservedKeys(entry.providerData, [
         'type',
         'file_data',
@@ -2777,7 +2771,7 @@ function convertToOutputItem(
   });
 }
 
-export { getToolChoice, converTool, getInputItems, convertToOutputItem };
+export { getToolChoice, convertTool, getInputItems, convertToOutputItem };
 
 const TERMINAL_RESPONSES_STREAM_EVENT_TYPES = new Set([
   'response.completed',
@@ -2863,13 +2857,92 @@ export class OpenAIResponsesModel implements Model {
   protected readonly _client: OpenAI;
   protected readonly _model: string;
 
-  constructor(client: OpenAI, model: string) {
-    this._client = client;
+  constructor(client: OpenAIClient, model: string) {
+    this._client = client as OpenAI;
     this._model = model;
   }
 
   getRetryAdvice(args: ModelRetryAdviceRequest): ModelRetryAdvice | undefined {
     return getOpenAIRetryAdvice(args);
+  }
+
+  /**
+   * @internal
+   */
+  protected _convertResponseOutputItems(
+    items: Array<Record<string, any>>,
+  ): protocol.OutputModelItem[] {
+    return convertToOutputItem(items as ResponseOutputItemWithFunctionResult[]);
+  }
+
+  /**
+   * @internal
+   */
+  protected _getResponseForSDKOutput(
+    response: OpenAI.Responses.Response,
+  ): OpenAI.Responses.Response {
+    return response;
+  }
+
+  /**
+   * @internal
+   */
+  protected _shouldEmitOutputTextDelta(
+    _event: Record<string, any>,
+    _outputItem: Record<string, any> | undefined,
+  ): boolean {
+    return true;
+  }
+
+  /**
+   * @internal
+   */
+  protected _shouldEmitRawModelEvent(_event: Record<string, any>): boolean {
+    return true;
+  }
+
+  /**
+   * @internal
+   */
+  protected _getResponsesCreateRequestOverrides(
+    _request: ModelRequest,
+    _requestData: Record<string, any>,
+  ): Record<string, any> {
+    return {};
+  }
+
+  /**
+   * @internal
+   */
+  protected _getResponseUsage(response: OpenAI.Responses.Response): Usage {
+    return new Usage({
+      inputTokens: response.usage?.input_tokens ?? 0,
+      outputTokens: response.usage?.output_tokens ?? 0,
+      totalTokens: response.usage?.total_tokens ?? 0,
+      inputTokensDetails: { ...response.usage?.input_tokens_details },
+      outputTokensDetails: { ...response.usage?.output_tokens_details },
+      requestUsageEntries: [
+        toRequestUsageEntry(response.usage, 'responses.create'),
+      ],
+    });
+  }
+
+  /**
+   * @internal
+   */
+  protected _getStreamedResponseUsage(
+    response: OpenAI.Responses.Response,
+  ): protocol.UsageData {
+    return {
+      inputTokens: response.usage?.input_tokens ?? 0,
+      outputTokens: response.usage?.output_tokens ?? 0,
+      totalTokens: response.usage?.total_tokens ?? 0,
+      inputTokensDetails: { ...response.usage?.input_tokens_details },
+      outputTokensDetails: { ...response.usage?.output_tokens_details },
+      requestUsageEntries: [
+        toRequestUsageEntry(response.usage, 'responses.create'),
+      ],
+    };
   }
 
   /**
@@ -3042,6 +3115,7 @@ export class OpenAIResponsesModel implements Model {
       prompt_cache_retention: normalizePromptCacheRetention(
         request.modelSettings.promptCacheRetention,
       ),
+      prompt_cache_options: request.modelSettings.promptCacheOptions,
       context_management: getContextManagement(
         request.modelSettings.contextManagement,
       ),
@@ -3054,6 +3128,11 @@ export class OpenAIResponsesModel implements Model {
         ...transportOverrides.extraBody,
       };
     }
+
+    requestData = {
+      ...requestData,
+      ...this._getResponsesCreateRequestOverrides(request, requestData),
+    };
 
     // Keep the transport mode aligned with the calling path even if extra_body includes stream.
     requestData.stream = stream;
@@ -3111,18 +3190,12 @@ export class OpenAIResponsesModel implements Model {
       return response;
     });
 
+    const responseForSDKOutput = this._getResponseForSDKOutput(response);
     const output: ModelResponse = {
-      usage: new Usage({
-        inputTokens: response.usage?.input_tokens ?? 0,
-        outputTokens: response.usage?.output_tokens ?? 0,
-        totalTokens: response.usage?.total_tokens ?? 0,
-        inputTokensDetails: { ...response.usage?.input_tokens_details },
-        outputTokensDetails: { ...response.usage?.output_tokens_details },
-        requestUsageEntries: [
-          toRequestUsageEntry(response.usage, 'responses.create'),
-        ],
-      }),
-      output: convertToOutputItem(response.output),
+      usage: this._getResponseUsage(response),
+      output: this._convertResponseOutputItems(
+        responseForSDKOutput.output as Array<Record<string, any>>,
+      ),
       responseId: response.id,
       requestId: getOpenAIResponseRequestId(response),
       providerData: response,
@@ -3151,8 +3224,27 @@ export class OpenAIResponsesModel implements Model {
       const response = await this._fetchResponse(request, true);
 
       let finalResponse: OpenAI.Responses.Response | undefined;
+      const outputItemsByIndex = new Map<number, Record<string, any>>();
       for await (const event of response) {
         const eventType = (event as { type?: string }).type;
+        const shouldEmitRawModelEvent = this._shouldEmitRawModelEvent(
+          event as unknown as Record<string, any>,
+        );
+        if (eventType === 'response.output_item.added') {
+          const outputItemAdded = event as unknown as {
+            output_index?: number;
+            item?: Record<string, any>;
+          };
+          if (
+            typeof outputItemAdded.output_index === 'number' &&
+            outputItemAdded.item
+          ) {
+            outputItemsByIndex.set(
+              outputItemAdded.output_index,
+              outputItemAdded.item,
+            );
+          }
+        }
         if (eventType === 'response.created') {
           yield {
             type: 'response_started',
@@ -3167,58 +3259,58 @@ export class OpenAIResponsesModel implements Model {
             };
           finalResponse = terminalEvent.response;
           const { response, ...remainingEvent } = terminalEvent;
-          const { output, usage, id, ...remainingResponse } = response;
+          const {
+            output: _output,
+            usage: _usage,
+            id,
+            ...remainingResponse
+          } = response;
+          const responseForSDKOutput = this._getResponseForSDKOutput(response);
           yield {
             type: 'response_done',
             response: {
               id: id,
               requestId: getOpenAIResponseRequestId(response),
-              output: convertToOutputItem(output),
-              usage: {
-                inputTokens: usage?.input_tokens ?? 0,
-                outputTokens: usage?.output_tokens ?? 0,
-                totalTokens: usage?.total_tokens ?? 0,
-                inputTokensDetails: {
-                  ...usage?.input_tokens_details,
-                },
-                outputTokensDetails: {
-                  ...usage?.output_tokens_details,
-                },
-                requestUsageEntries: [
-                  toRequestUsageEntry(usage, 'responses.create'),
-                ],
-              },
+              output: this._convertResponseOutputItems(
+                responseForSDKOutput.output as Array<Record<string, any>>,
+              ),
+              usage: this._getStreamedResponseUsage(response),
               providerData: remainingResponse,
             },
             providerData: remainingEvent,
           };
-          if (eventType === 'response.completed') {
+        } else if (eventType === 'response.output_text.delta') {
+          const { delta, ...remainingEvent } = event as unknown as {
+            delta: string;
+            output_index?: number;
+          } & Record<string, any>;
+          const outputItem =
+            typeof remainingEvent.output_index === 'number'
+              ? outputItemsByIndex.get(remainingEvent.output_index)
+              : undefined;
+          if (
+            this._shouldEmitOutputTextDelta(
+              event as unknown as Record<string, any>,
+              outputItem,
+            )
+          ) {
             yield {
-              type: 'model',
-              event: event,
-              providerData: {
-                rawModelEventSource: OPENAI_RESPONSES_RAW_MODEL_EVENT_SOURCE,
-              },
+              type: 'output_text_delta',
+              delta: delta,
+              providerData: remainingEvent,
             };
           }
-        } else if (eventType === 'response.output_text.delta') {
-          const { delta, ...remainingEvent } = event as {
-            delta: string;
-          } & Record<string, any>;
-          yield {
-            type: 'output_text_delta',
-            delta: delta,
-            providerData: remainingEvent,
-          };
         }
 
-        yield {
-          type: 'model',
-          event: event,
-          providerData: {
-            rawModelEventSource: OPENAI_RESPONSES_RAW_MODEL_EVENT_SOURCE,
-          },
-        };
+        if (shouldEmitRawModelEvent) {
+          yield {
+            type: 'model',
+            event: event,
+            providerData: {
+              rawModelEventSource: OPENAI_RESPONSES_RAW_MODEL_EVENT_SOURCE,
+            },
+          };
+        }
       }
 
       if (request.tracing && span && finalResponse) {
@@ -3277,7 +3369,7 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
   #wsRequestLock: Promise<void> = Promise.resolve();
 
   constructor(
-    client: OpenAI,
+    client: OpenAIClient,
     model: string,
     options: OpenAIResponsesWSModelOptions = {},
   ) {
@@ -3450,7 +3542,6 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
           }
           throw new ResponsesWebSocketInternalError(
             'connection_closed_before_terminal_response_event',
-            'Responses websocket connection closed before a terminal response event.',
           );
         }
 
@@ -3630,8 +3721,7 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
     mergeQueryParamsIntoURL(
       baseURL,
       clientWithInternals._options?.defaultQuery as
-        | Record<string, unknown>
-        | undefined,
+        Record<string, unknown> | undefined,
     );
     if (explicitBaseQuery && Array.from(explicitBaseQuery.keys()).length > 0) {
       const explicitTopLevelKeys = new Set<string>();
@@ -3818,8 +3908,7 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
   }
 
   #createWebSocketRequestTimeoutDeadline():
-    | WebSocketRequestTimeoutDeadline
-    | undefined {
+    WebSocketRequestTimeoutDeadline | undefined {
     const timeoutMs = this.#getWebSocketFrameReadTimeoutMs();
     if (
       typeof timeoutMs !== 'number' ||
@@ -3895,59 +3984,4 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       frameReadTimeout.errorMessage,
     );
   }
-}
-
-/**
- * Sending an empty string for instructions can override the prompt parameter.
- * Thus, this method checks if the instructions is an empty string and returns undefined if it is.
- * @param instructions - The instructions to normalize.
- * @returns The normalized instructions.
- */
-function normalizeInstructions(
-  instructions: string | undefined,
-): string | undefined {
-  if (typeof instructions === 'string') {
-    if (instructions.trim() === '') {
-      return undefined;
-    }
-    return instructions;
-  }
-  return undefined;
-}
-
-function searchParamsToAuthHeaderQuery(
-  searchParams: URLSearchParams,
-): Record<string, string | string[]> | undefined {
-  const query: Record<string, string | string[]> = {};
-  let hasEntries = false;
-
-  for (const [key, value] of searchParams.entries()) {
-    hasEntries = true;
-    const existingValue = query[key];
-    if (typeof existingValue === 'undefined') {
-      query[key] = value;
-      continue;
-    }
-    if (Array.isArray(existingValue)) {
-      existingValue.push(value);
-      continue;
-    }
-    query[key] = [existingValue, value];
-  }
-
-  return hasEntries ? query : undefined;
-}
-
-function toRequestUsageEntry(
-  usage: OpenAI.Responses.ResponseUsage | undefined,
-  endpoint: string,
-): RequestUsage {
-  return new RequestUsage({
-    inputTokens: usage?.input_tokens ?? 0,
-    outputTokens: usage?.output_tokens ?? 0,
-    totalTokens: usage?.total_tokens ?? 0,
-    inputTokensDetails: { ...usage?.input_tokens_details },
-    outputTokensDetails: { ...usage?.output_tokens_details },
-    endpoint,
-  });
 }

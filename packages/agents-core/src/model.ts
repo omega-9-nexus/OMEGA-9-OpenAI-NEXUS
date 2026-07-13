@@ -20,14 +20,11 @@ import {
 } from './types';
 
 export type ModelSettingsToolChoice =
-  | 'auto'
-  | 'required'
-  | 'none'
-  | (string & {});
+  'auto' | 'required' | 'none' | (string & {});
 
 /**
  * Constrains effort on reasoning for [reasoning models](https://platform.openai.com/docs/guides/reasoning).
- * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
+ * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
  * Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning in a response.
  */
 export type ModelSettingsReasoningEffort =
@@ -37,6 +34,7 @@ export type ModelSettingsReasoningEffort =
   | 'medium'
   | 'high'
   | 'xhigh'
+  | 'max'
   | null;
 
 /**
@@ -44,11 +42,21 @@ export type ModelSettingsReasoningEffort =
  */
 export type ModelSettingsReasoning = {
   /**
+   * Controls which reasoning items are rendered back to the model on later turns.
+   */
+  context?: 'auto' | 'current_turn' | 'all_turns' | null;
+
+  /**
    * Constrains effort on reasoning for [reasoning models](https://platform.openai.com/docs/guides/reasoning).
-   * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
+   * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
    * Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning in a response.
    */
   effort?: ModelSettingsReasoningEffort | null;
+
+  /**
+   * Controls the reasoning execution mode for the request.
+   */
+  mode?: 'standard' | 'pro' | (string & {});
 
   /**
    * A summary of the reasoning performed by the model.
@@ -56,6 +64,21 @@ export type ModelSettingsReasoning = {
    * One of `auto`, `concise`, or `detailed`.
    */
   summary?: 'auto' | 'concise' | 'detailed' | null;
+};
+
+/**
+ * Prompt-cache configuration for supported model providers.
+ */
+export type ModelSettingsPromptCacheOptions = {
+  /**
+   * Controls whether the provider creates an implicit cache breakpoint.
+   */
+  mode?: 'implicit' | 'explicit';
+
+  /**
+   * The minimum lifetime applied to cache breakpoints written by the request.
+   */
+  ttl?: '30m';
 };
 
 export interface ModelSettingsText {
@@ -301,6 +324,11 @@ export type ModelSettings = {
   promptCacheRetention?: 'in-memory' | '24h' | null;
 
   /**
+   * Controls implicit and explicit prompt caching for supported model providers.
+   */
+  promptCacheOptions?: ModelSettingsPromptCacheOptions;
+
+  /**
    * Context-management strategies to apply when calling the model.
    * This setting is available on OpenAI Responses requests, including server-side compaction.
    * See https://developers.openai.com/api/docs/guides/compaction.
@@ -514,6 +542,7 @@ export type ModelRequest = {
    */
   _internal?: {
     runnerManagedRetry?: boolean;
+    reasoningEffortImplicit?: boolean;
   };
 };
 

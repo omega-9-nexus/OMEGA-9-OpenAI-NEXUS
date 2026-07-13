@@ -1476,6 +1476,67 @@ describe('Runner.run (streaming)', () => {
     }
   });
 
+  it('handles invalid final output errors with an error handler', async () => {
+    class InvalidFinalOutputStreamingModel implements Model {
+      async getResponse(_req: ModelRequest): Promise<ModelResponse> {
+        return {
+          output: [fakeModelMessage('not valid json')],
+          usage: new Usage(),
+        };
+      }
+
+      async *getStreamedResponse(
+        req: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        const response = await this.getResponse(req);
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'r_invalid_final_output',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: response.output,
+          },
+        } as any;
+      }
+    }
+
+    const agent = new Agent({
+      name: 'InvalidFinalOutputHandlerStream',
+      outputType: z.object({ summary: z.string() }),
+      model: new InvalidFinalOutputStreamingModel(),
+    });
+    const result = await run(agent, 'x', {
+      stream: true,
+      errorHandlers: {
+        invalidFinalOutput: () => ({
+          finalOutput: { summary: 'safe fallback' },
+        }),
+      },
+    });
+    const events: RunStreamEvent[] = [];
+    for await (const event of result.toStream()) {
+      events.push(event);
+    }
+    await result.completed;
+
+    expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+    const runItemEvents = events.filter(
+      (event): event is RunItemStreamEvent =>
+        event.type === 'run_item_stream_event',
+    );
+    expect(runItemEvents).toHaveLength(2);
+    expect(runItemEvents[1].name).toBe('message_output_created');
+    expect(runItemEvents[1].item).toBeInstanceOf(RunMessageOutputItem);
+    if (runItemEvents[1].item instanceof RunMessageOutputItem) {
+      expect(runItemEvents[1].item.content).toBe('{"summary":"safe fallback"}');
+    }
+  });
+
   it('does not advance the turn for streaming runs resuming an interruption without persisted items', async () => {
     const approvalTool = tool({
       name: 'get_weather',
@@ -2409,6 +2470,64 @@ describe('Runner.run (streaming)', () => {
         type: 'function_call_result',
         callId: 'call-stream',
       });
+    });
+
+    it('does not replay an acknowledged function result across consecutive streamed approvals', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'approval tool',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+      const model = new TrackingStreamingModel([
+        buildTurn([buildToolCall('call-stream-1', 'first')], 'resp-stream-1'),
+        buildTurn([buildToolCall('call-stream-2', 'second')], 'resp-stream-2'),
+        buildTurn([fakeModelMessage('done')], 'resp-stream-3'),
+      ]);
+      const agent = new Agent({
+        name: 'ConsecutiveStreamApprovalAgent',
+        model,
+        tools: [approvalTool],
+      });
+      const runner = new Runner();
+
+      const firstResult = await runner.run(agent, 'user_message', {
+        stream: true,
+        previousResponseId: 'initial-response',
+      });
+      await drain(firstResult);
+      expect(firstResult.interruptions).toHaveLength(1);
+      firstResult.state.approve(firstResult.interruptions[0]);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        stream: true,
+        previousResponseId: 'initial-response',
+      });
+      await drain(secondResult);
+      expect(secondResult.interruptions).toHaveLength(1);
+      secondResult.state.approve(secondResult.interruptions[0]);
+
+      const thirdResult = await runner.run(agent, secondResult.state, {
+        stream: true,
+        previousResponseId: 'initial-response',
+      });
+      await drain(thirdResult);
+
+      expect(thirdResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(3);
+      expect(model.requests[1].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: 'call-stream-1',
+        }),
+      ]);
+      expect(model.requests[2].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: 'call-stream-2',
+        }),
+      ]);
     });
 
     it('uses runner-level toolErrorFormatter when resuming a rejected approval', async () => {
