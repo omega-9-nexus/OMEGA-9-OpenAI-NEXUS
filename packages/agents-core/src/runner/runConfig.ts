@@ -1,6 +1,7 @@
 import { getDefaultModelSettings } from '../defaultModel';
 import { UserError } from '../errors';
 import type { ModelSettings } from '../model';
+import type { ToolExecutionPolicy } from './toolPolicy';
 
 export type ToolExecutionConfig = {
   /**
@@ -14,6 +15,12 @@ export type ToolExecutionConfig = {
    * The same guardrails still run again immediately before tool execution after approval.
    */
   preApprovalInputGuardrails?: boolean;
+  /**
+   * Optional run-level authorization policy for function-tool calls.
+   * Policies can allow execution, require the SDK's native approval flow, or deny a call.
+   * Policy evaluation is fail-closed: thrown errors and malformed decisions deny execution.
+   */
+  policy?: ToolExecutionPolicy<any>;
 };
 
 export function getImplicitModelSettingsForResolvedModel(
@@ -34,12 +41,18 @@ export function validateToolExecutionConfig(
 ): ToolExecutionConfig | undefined {
   const maxConcurrency = config?.maxFunctionToolConcurrency;
   const preApprovalInputGuardrails = config?.preApprovalInputGuardrails;
+  const policy = config?.policy;
   if (
     typeof preApprovalInputGuardrails !== 'undefined' &&
     typeof preApprovalInputGuardrails !== 'boolean'
   ) {
     throw new UserError(
       'toolExecution.preApprovalInputGuardrails must be a boolean when provided.',
+    );
+  }
+  if (typeof policy !== 'undefined' && typeof policy !== 'function') {
+    throw new UserError(
+      'toolExecution.policy must be a function when provided.',
     );
   }
   if (maxConcurrency == null) {
